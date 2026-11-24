@@ -110,9 +110,14 @@ async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 async def message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Для дозволеного завантаження використовуй /save та посилання."
-    )
+    url = update.message.text.strip()
+    if url.startswith("https://"):
+        context.args = [url]
+        await save(update, context)
+    else:
+        await update.message.reply_text(
+            "Надішли посилання на власне або дозволене відео з TikTok, Instagram чи YouTube."
+        )
 
 threading.Thread(target=health_server, daemon=True).start()
 
