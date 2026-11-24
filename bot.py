@@ -1,15 +1,15 @@
-
 import os
 import asyncio
 import tempfile
 import threading
 import logging
-import sqlite3
 import time
 from pathlib import Path
 from urllib.parse import urlparse, quote
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from contextlib import closing
 
+import psycopg2
 import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -22,7 +22,7 @@ from telegram.ext import (
 
 TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-DB_PATH = os.environ.get("DB_PATH", "stats.db")
+DATABASE_URL = os.environ["DATABASE_URL"]
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -33,30 +33,80 @@ active_users = set()
 last_alert = 0
 MAX_SIZE = 45 * 1024 * 1024
 
+
+def get_db():
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require",
+        connect_timeout=10
+    )
+
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as db:
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS users "
-            "(id INTEGER PRIMARY KEY)"
-        )
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS downloads "
-            "(id INTEGER PRIMARY KEY, platform TEXT, success INTEGER)"
-        )
+    with closing(get_db()) as db:
+        with db:
+            with db.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id BIGINT PRIMARY KEY
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS downloads (
+                        id BIGSERIAL PRIMARY KEY,
+                        platform TEXT,
+                        success INTEGER
+                    )
+                """)
+
+                cur.execute(
+                    "ALTER TABLE users ENABLE ROW LEVEL SECURITY"
+                )
+                cur.execute(
+                    "ALTER TABLE downloads ENABLE ROW LEVEL SECURITY"
+                )
+
+    logger.info("Supabase database connected successfully")
+
 
 def register_user(user_id):
-    with sqlite3.connect(DB_PATH) as db:
-        db.execute(
-            "INSERT OR IGNORE INTO users VALUES (?)",
-            (user_id,)
-        )
+    with closing(get_db()) as db:
+        with db:
+            with db.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (id) VALUES (%s) "
+                    "ON CONFLICT (id) DO NOTHING",
+                    (user_id,)
+                )
+
 
 def record_download(platform, success):
-    with sqlite3.connect(DB_PATH) as db:
-        db.execute(
-            "INSERT INTO downloads (platform, success) VALUES (?, ?)",
-            (platform, int(success))
-        )
+    with closing(get_db()) as db:
+        with db:
+            with db.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO downloads (platform, success) "
+                    "VALUES (%s, %s)",
+                    (platform, int(success))
+                )
+
+
+def read_stats():
+    with closing(get_db()) as db:
+        with db.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM users")
+            users = cur.fetchone()[0]
+
+            cur.execute("""
+                SELECT COUNT(*),
+                COUNT(*) FILTER (WHERE success = 1)
+                FROM downloads
+            """)
+            total, success = cur.fetchone()
+
+    return users, total, success
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
@@ -71,19 +121,25 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+
 def health_server():
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
+
 def share_keyboard():
     link = "https://t.me/VideoSaverUA24_bot"
     share = "https://t.me/share/url?url=" + quote(link, safe="")
+
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📲 Поділитися ботом", url=share)]
     ])
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update.effective_user.id)
+    await asyncio.to_thread(
+        register_user, update.effective_user.id
+    )
 
     await update.message.reply_text(
         "🎬 Вітаю у VideoSaver UA!\n\n"
@@ -98,27 +154,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=share_keyboard()
     )
 
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Твій Telegram ID: {update.effective_user.id}"
     )
 
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    with sqlite3.connect(DB_PATH) as db:
-        users = db.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
-
-        total = db.execute(
-            "SELECT COUNT(*) FROM downloads"
-        ).fetchone()[0]
-
-        success = db.execute(
-            "SELECT COUNT(*) FROM downloads WHERE success=1"
-        ).fetchone()[0]
+    users, total, success = await asyncio.to_thread(read_stats)
 
     await update.message.reply_text(
         "📊 Статистика VideoSaver UA\n\n"
@@ -127,6 +174,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Успішних: {success}\n"
         f"❌ Невдалих: {total - success}"
     )
+
 
 def download(url, folder):
     options = {
@@ -143,6 +191,7 @@ def download(url, folder):
 
     with yt_dlp.YoutubeDL(options) as ydl:
         ydl.download([url])
+
 
 async def notify_admin(context, platform, error):
     global last_alert
@@ -162,7 +211,7 @@ async def notify_admin(context, platform, error):
             chat_id=ADMIN_ID,
             text=(
                 "⚠️ Помилка VideoSaver UA\n\n"
-                f"Платформа: {platform}\n"
+                f"Платформа або сервіс: {platform}\n"
                 f"Тип: {type(error).__name__}\n"
                 "Перевір журнали Render."
             )
@@ -170,9 +219,24 @@ async def notify_admin(context, platform, error):
     except Exception:
         logger.warning("Admin notification failed")
 
+
+async def safe_record(context, platform, success):
+    try:
+        await asyncio.to_thread(
+            record_download, platform, success
+        )
+    except Exception as error:
+        logger.error(
+            "Database write failed: %s",
+            type(error).__name__
+        )
+        await notify_admin(context, "Supabase", error)
+
+
 async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    register_user(user_id)
+
+    await asyncio.to_thread(register_user, user_id)
 
     if len(context.args) != 1:
         await update.message.reply_text(
@@ -186,7 +250,9 @@ async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed = urlparse(url)
         host = parsed.hostname or ""
     except ValueError:
-        await update.message.reply_text("Некоректне посилання.")
+        await update.message.reply_text(
+            "Некоректне посилання."
+        )
         return
 
     allowed = {
@@ -226,7 +292,9 @@ async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 with tempfile.TemporaryDirectory() as folder:
-                    await asyncio.to_thread(download, url, folder)
+                    await asyncio.to_thread(
+                        download, url, folder
+                    )
 
                     files = list(Path(folder).glob("*.mp4"))
 
@@ -245,7 +313,8 @@ async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
 
             except Exception as error:
-                record_download(platform, False)
+                await safe_record(context, platform, False)
+
                 logger.error(
                     "Download failed: %s — %s",
                     platform,
@@ -261,11 +330,12 @@ async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            record_download(platform, True)
+            await safe_record(context, platform, True)
             await status.edit_text("✅ Готово!")
 
     finally:
         active_users.discard(user_id)
+
 
 async def message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
@@ -278,6 +348,26 @@ async def message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔗 Надішли посилання на відео з TikTok, "
             "Instagram або YouTube."
         )
+
+
+async def error_handler(update, context):
+    error = context.error
+
+    logger.error(
+        "Application error: %s",
+        type(error).__name__
+    )
+
+    await notify_admin(context, "Bot / Database", error)
+
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Тимчасова помилка. Спробуй трохи пізніше."
+            )
+        except Exception:
+            pass
+
 
 init_db()
 
@@ -297,9 +387,13 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("save", save))
 app.add_handler(CommandHandler("stats", stats))
 app.add_handler(CommandHandler("myid", myid))
+
 app.add_handler(MessageHandler(
     filters.TEXT & ~filters.COMMAND,
     message
 ))
 
+app.add_error_handler(error_handler)
+
 app.run_polling()
+
