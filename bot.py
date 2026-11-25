@@ -15,7 +15,7 @@ from contextlib import closing
 
 import psycopg2
 import yt_dlp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -142,7 +142,41 @@ def share_keyboard():
     ])
 
 
+
+MENU = ReplyKeyboardMarkup([
+    ["📥 Завантажити", "📊 Статистика бота"],
+    ["🌐 Платформи", "📖 Інструкція"],
+    ["🆘 Повідомити про проблему", "📲 Поділитися ботом"]
+], resize_keyboard=True, is_persistent=True)
+
+async def menu(update, context):
+    context.user_data.pop("feedback", None)
+    await update.message.reply_text("🎬 Обери функцію або надішли посилання.", reply_markup=MENU)
+
+async def public_stats(update, context):
+    users, total, success = await asyncio.to_thread(read_stats)
+    await update.message.reply_text(f"📊 VideoSaver UA\n\n👥 Користувачів: {users}\n📥 Успішних завантажень: {success}", reply_markup=MENU)
+
+async def help_user(update, context):
+    await update.message.reply_text("1. Скопіюй посилання на власне або дозволене медіа.\n2. Надішли його боту.\n3. Обери відео, MP3 або фото.\nЛіміт файлу — 45 МіБ. Stories поки не підтримуються. Доступність залежить від публікації.", reply_markup=MENU)
+
+async def feedback(update, context):
+    if not ADMIN_ID:
+        await update.message.reply_text("Зворотний зв'язок тимчасово недоступний.")
+        return
+    context.user_data["feedback"] = time.monotonic()
+    await update.message.reply_text("Опиши проблему одним повідомленням. Текст та твій Telegram ID будуть передані адміністратору. Не надсилай паролі. Для скасування — /menu.")
+
+async def post_init(application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "Почати"), BotCommand("menu", "Головне меню"),
+        BotCommand("help", "Інструкція"), BotCommand("info", "Статистика бота"),
+        BotCommand("feedback", "Повідомити про проблему")
+    ])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("feedback", None)
     await asyncio.to_thread(
         register_user, update.effective_user.id
     )
@@ -158,7 +192,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🇺🇦 Українською мовою\n\n"
         "Завантажуй власні відео або контент, "
         "на збереження якого маєш дозвіл.",
-        reply_markup=share_keyboard()
+        reply_markup=MENU
     )
 
 
@@ -362,16 +396,38 @@ async def choose_media(update, context):
 
 
 async def message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-
-    if url.startswith("https://"):
-        context.args = [url]
+    text = update.message.text.strip()
+    if text == "🆘 Повідомити про проблему":
+        await feedback(update, context)
+        return
+    if text in {"📥 Завантажити", "📊 Статистика бота", "🌐 Платформи", "📖 Інструкція", "📲 Поділитися ботом"}:
+        context.user_data.pop("feedback", None)
+        if text == "📊 Статистика бота":
+            await public_stats(update, context)
+        elif text == "📖 Інструкція":
+            await help_user(update, context)
+        elif text == "📲 Поділитися ботом":
+            await update.message.reply_text("Запроси друзів!", reply_markup=share_keyboard())
+        elif text == "🌐 Платформи":
+            await update.message.reply_text("TikTok, Instagram, YouTube, Facebook, Threads. Формати залежать від публікації. Stories поки не підтримуються.", reply_markup=MENU)
+        else:
+            await update.message.reply_text("Надішли посилання на медіа.", reply_markup=MENU)
+        return
+    started = context.user_data.pop("feedback", None)
+    if started is not None and time.monotonic() - started < 600:
+        now = time.monotonic()
+        if now - context.user_data.get("last_feedback", -1000) < 60:
+            await update.message.reply_text("Зачекай хвилину перед наступним зверненням.")
+            return
+        context.user_data["last_feedback"] = now
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"🆘 Звернення від користувача {update.effective_user.id}:\n{text[:3000]}")
+        await update.message.reply_text("✅ Звернення надіслано.", reply_markup=MENU)
+        return
+    if text.startswith("https://"):
+        context.args = [text]
         await save(update, context)
     else:
-        await update.message.reply_text(
-            "🔗 Надішли посилання на відео з TikTok, "
-            "Instagram, YouTube, Facebook або Threads."
-        )
+        await menu(update, context)
 
 
 async def error_handler(update, context):
@@ -404,10 +460,15 @@ app = (
     Application.builder()
     .token(TOKEN)
     .concurrent_updates(8)
+    .post_init(post_init)
     .build()
 )
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("menu", menu))
+app.add_handler(CommandHandler("help", help_user))
+app.add_handler(CommandHandler("info", public_stats))
+app.add_handler(CommandHandler("feedback", feedback))
 app.add_handler(CommandHandler("save", save))
 app.add_handler(CommandHandler("stats", stats))
 app.add_handler(CommandHandler("myid", myid))
