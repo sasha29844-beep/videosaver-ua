@@ -144,7 +144,7 @@ def share_keyboard():
 
 
 MENU = ReplyKeyboardMarkup([
-    ["📥 Завантажити", "📊 Статистика бота"],
+    ["📥 Завантажити"],
     ["🌐 Платформи", "📖 Інструкція"],
     ["🆘 Повідомити про проблему", "📲 Поділитися ботом"]
 ], resize_keyboard=True, is_persistent=True)
@@ -152,10 +152,6 @@ MENU = ReplyKeyboardMarkup([
 async def menu(update, context):
     context.user_data.pop("feedback", None)
     await update.message.reply_text("🎬 Обери функцію або надішли посилання.", reply_markup=MENU)
-
-async def public_stats(update, context):
-    users, total, success = await asyncio.to_thread(read_stats)
-    await update.message.reply_text(f"📊 VideoSaver UA\n\n👥 Користувачів: {users}\n📥 Успішних завантажень: {success}", reply_markup=MENU)
 
 async def help_user(update, context):
     await update.message.reply_text("1. Скопіюй посилання на власне або дозволене медіа.\n2. Надішли його боту.\n3. Обери відео, MP3 або фото.\nЛіміт файлу — 45 МіБ. Stories поки не підтримуються. Доступність залежить від публікації.", reply_markup=MENU)
@@ -170,7 +166,7 @@ async def feedback(update, context):
 async def post_init(application):
     await application.bot.set_my_commands([
         BotCommand("start", "Почати"), BotCommand("menu", "Головне меню"),
-        BotCommand("help", "Інструкція"), BotCommand("info", "Статистика бота"),
+        BotCommand("help", "Інструкція"),
         BotCommand("feedback", "Повідомити про проблему")
     ])
 
@@ -403,7 +399,7 @@ async def message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in {"📥 Завантажити", "📊 Статистика бота", "🌐 Платформи", "📖 Інструкція", "📲 Поділитися ботом"}:
         context.user_data.pop("feedback", None)
         if text == "📊 Статистика бота":
-            await public_stats(update, context)
+            await menu(update, context)
         elif text == "📖 Інструкція":
             await help_user(update, context)
         elif text == "📲 Поділитися ботом":
@@ -467,7 +463,6 @@ app = (
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("menu", menu))
 app.add_handler(CommandHandler("help", help_user))
-app.add_handler(CommandHandler("info", public_stats))
 app.add_handler(CommandHandler("feedback", feedback))
 app.add_handler(CommandHandler("save", save))
 app.add_handler(CommandHandler("stats", stats))
