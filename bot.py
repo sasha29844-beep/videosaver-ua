@@ -5,6 +5,7 @@ import threading
 import logging
 import time
 import secrets
+import re
 import subprocess
 import sys
 import imageio_ffmpeg
@@ -36,7 +37,9 @@ logger = logging.getLogger("VideoSaver")
 limit = asyncio.Semaphore(2)
 active_users = set()
 last_alert = 0
-MAX_SIZE = 45 * 1024 * 1024
+MAX_SIZE = 48 * 1000 * 1000
+MAX_VIDEO_INPUT = 200 * 1000 * 1000
+compression_lock = threading.Lock()
 pending = {}
 
 
@@ -154,7 +157,7 @@ async def menu(update, context):
     await update.message.reply_text("🎬 Обери функцію або надішли посилання.", reply_markup=MENU)
 
 async def help_user(update, context):
-    await update.message.reply_text("1. Скопіюй посилання на власне або дозволене медіа.\n2. Надішли його боту.\n3. Обери відео, MP3 або фото.\nЛіміт файлу — 45 МіБ. Stories поки не підтримуються. Доступність залежить від публікації.", reply_markup=MENU)
+    await update.message.reply_text("1. Скопіюй посилання на власне або дозволене медіа.\n2. Надішли його боту.\n3. Обери відео, MP3 або фото.\nЛіміт файлу — 48 МБ. Stories поки не підтримуються. Доступність залежить від публікації.", reply_markup=MENU)
 
 async def feedback(update, context):
     if not ADMIN_ID:
@@ -213,6 +216,42 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def compress_video(path):
+    if path.stat().st_size <= MAX_SIZE:
+        return path
+    if path.stat().st_size > MAX_VIDEO_INPUT:
+        raise ValueError("Input video too large")
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    with compression_lock:
+        probe = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path)],
+                               capture_output=True, text=True, timeout=20)
+        match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", probe.stderr)
+        if not match:
+            raise ValueError("Unknown video duration")
+        h, m, sec = map(float, match.groups())
+        duration = h * 3600 + m * 60 + sec
+        if duration <= 0 or duration > 1800:
+            raise ValueError("Unsupported compression duration")
+        output = path.with_name("optimized.mp4")
+        for target in (46_000_000, 39_000_000):
+            total = int(target * 8 / duration / 1000)
+            audio = 96 if total >= 400 else 64
+            bitrate = total - audio - 12
+            if bitrate < 80:
+                raise ValueError("Video too long for size limit")
+            edge = 1920 if bitrate >= 2200 else 1280 if bitrate >= 900 else 854 if bitrate >= 350 else 640
+            vf = f"scale='min({edge},iw)':'min({edge},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
+            subprocess.run([ffmpeg, "-nostdin", "-y", "-loglevel", "error",
+                            "-threads", "1", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?",
+                            "-vf", vf, "-filter_threads", "1", "-c:v", "libx264", "-preset", "veryfast",
+                            "-threads", "1", "-pix_fmt", "yuv420p", "-b:v", f"{bitrate}k",
+                            "-c:a", "aac", "-b:a", f"{audio}k", "-movflags", "+faststart", str(output)],
+                           check=True, timeout=300, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if 0 < output.stat().st_size <= MAX_SIZE:
+                return output
+        raise ValueError("Compressed video too large")
+
+
 def download(url, folder, mode):
     if mode == "photo":
         subprocess.run([sys.executable, "-m", "gallery_dl", "--ignore-config",
@@ -222,10 +261,10 @@ def download(url, folder, mode):
         return sorted(p for p in Path(folder).rglob("*")
                       if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"})
     options = {
-        "format": "bestaudio/best" if mode == "audio" else "best[ext=mp4][filesize<45M]/best[ext=mp4]",
+        "format": "bestaudio/best" if mode == "audio" else "best[ext=mp4][filesize<=48000000]/best[ext=mp4][filesize<=200000000]/best[ext=mp4][filesize<=?200000000]",
         "outtmpl": folder + "/media.%(ext)s",
         "noplaylist": True,
-        "max_filesize": MAX_SIZE,
+        "max_filesize": MAX_VIDEO_INPUT if mode == "video" else MAX_SIZE,
         "socket_timeout": 20,
         "retries": 2,
         "extractor_retries": 2,
@@ -237,7 +276,8 @@ def download(url, folder, mode):
         options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}]
     with yt_dlp.YoutubeDL(options) as ydl:
         ydl.download([url])
-    return list(Path(folder).glob("*.mp3" if mode == "audio" else "*.mp4"))
+    files = list(Path(folder).glob("*.mp3" if mode == "audio" else "*.mp4"))
+    return [compress_video(p) for p in files] if mode == "video" else files
 
 
 async def notify_admin(context, platform, error):
